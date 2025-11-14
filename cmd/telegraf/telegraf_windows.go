@@ -100,7 +100,11 @@ func (t *Telegraf) Run() error {
 func (t *Telegraf) Execute(_ []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	// Mark the status as startup pending until we are fully started
 	const accepted = svc.AcceptStop | svc.AcceptShutdown
-	changes <- svc.Status{State: svc.StartPending}
+
+	// Windows has a 30-second timeout for service startup. To prevent timeout
+	// errors, we use WaitHint to indicate to Windows that we need more time.
+	// WaitHint is specified in milliseconds.
+	changes <- svc.Status{State: svc.StartPending, WaitHint: 30000}
 	defer func() {
 		changes <- svc.Status{State: svc.Stopped}
 	}()
@@ -132,6 +136,11 @@ func (t *Telegraf) Execute(_ []string, r <-chan svc.ChangeRequest, changes chan<
 	go func() {
 		loopErr <- t.reloadLoop()
 	}()
+
+	// Report service as running immediately - Windows has a 30-second timeout
+	// for service startup and will report a timeout error if not reported quickly.
+	// The main processing loop runs in the background and any startup delays
+	// in plugins won't block the service status report.
 	changes <- svc.Status{State: svc.Running, Accepts: accepted}
 
 	for {
@@ -317,7 +326,36 @@ func startService(name string) error {
 		return fmt.Errorf("service is not stopped but in state %q", stateDescription(status.State))
 	}
 
-	return service.Start()
+	// Start the service
+	if err := service.Start(); err != nil {
+		return fmt.Errorf("starting service failed: %w", err)
+	}
+
+	// Wait for the service to transition from StartPending to Running state.
+	// Respect the WaitHint provided by the service (e.g., 30000ms = 30 seconds).
+	maxWaitTime := 60 * time.Second
+	deadlineTime := time.Now().Add(maxWaitTime)
+
+	for {
+		time.Sleep(300 * time.Millisecond)
+
+		status, err := service.Query()
+		if err != nil {
+			return fmt.Errorf("querying service state failed: %w", err)
+		}
+
+		if status.State == svc.Running {
+			return nil
+		}
+
+		if status.State != svc.StartPending {
+			return fmt.Errorf("service failed to start, state is %q", stateDescription(status.State))
+		}
+
+		if time.Now().After(deadlineTime) {
+			return fmt.Errorf("timeout waiting for service to start (waited %v seconds)", maxWaitTime.Seconds())
+		}
+	}
 }
 
 func stopService(name string) error {
